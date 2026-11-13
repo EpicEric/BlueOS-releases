@@ -1,0 +1,287 @@
+name: Release BlueOS
+
+on:
+  push:
+    tags: ["*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build. Must not already have a published release."
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  # A release either lands whole or not at all. Cancelling midway can leave the
+  # manifest listing a store path that was never pushed to the cache.
+  cancel-in-progress: false
+
+jobs:
+  image:
+    name: Build the RPi image (${{ matrix.board }})
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        board: [pi4, pi5]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Free disk space
+        uses: wimpysworld/nothing-but-nix@687c797a730352432950c707ab493fcc951818d7 # v10
+
+      - name: Install Nix
+        uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6 # v1.0.0
+        with:
+          add-channel: "true"
+          extra-conf: |
+            accept-flake-config = true
+            extra-substituters = ${{ vars.NIKS3_SERVER_URL }}
+            extra-trusted-public-keys = ${{ vars.NIKS3_PUBLIC_KEY }}
+            # Prevent out-of-memory SIGTERM
+            max-jobs = 1
+
+      - name: Install niks3
+        run: nix profile install nixpkgs#niks3
+
+      # Written once, in a step of its own, so the token never appears in the
+      # other scripts' command lines.
+      - name: Write the cache token
+        env:
+          NIKS3_AUTH_TOKEN: ${{ secrets.NIKS3_AUTH_TOKEN }}
+        run: |
+          printf '%s\n' "$NIKS3_AUTH_TOKEN" > /tmp/niks3-token
+          chmod 600 /tmp/niks3-token
+
+      # Cheap, and it fails before the multi-hour build rather than after it.
+      - name: Check the tag matches the version in the BlueOS commit
+        env:
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          expected="$(nix eval --raw ".#nixosConfigurations.blueos-${{ matrix.board }}.config.services.blueos.version")"
+          echo "tag=$TAG version=$expected"
+          if [ "$TAG" != "$expected" ]; then
+            echo "::error::Tag $TAG does not match the BlueOS version $expected. Bump the version literal in the BlueOS commit before tagging."
+            exit 1
+          fi
+
+      - name: Build the kernel
+        run: |
+          nix build --no-link --print-out-paths \
+            .#nixosConfigurations.blueos-${{ matrix.board }}.config.boot.kernelPackages.kernel \
+            .#nixosConfigurations.blueos-${{ matrix.board }}.config.boot.kernelPackages.kernel.modules \
+            > "$RUNNER_TEMP/kernel"
+
+      - name: Push the kernel to the cache
+        env:
+          NIKS3_AUTH_TOKEN_FILE: "/tmp/niks3-token"
+          NIKS3_SERVER_URL: ${{ vars.NIKS3_SERVER_URL }}
+        run: |
+          xargs niks3 push < "$RUNNER_TEMP/kernel"
+
+      - name: Build the system
+        run: |
+          nix build --cores 2 --no-link --print-out-paths \
+            .#nixosConfigurations.blueos-${{ matrix.board }}.config.system.build.toplevel \
+            > "$RUNNER_TEMP/toplevel"
+
+      # Before the manifest can name it: a manifest entry is useless if the
+      # closure is not in the cache devices trust.
+      - name: Push the system to the cache
+        env:
+          NIKS3_AUTH_TOKEN_FILE: "/tmp/niks3-token"
+          NIKS3_SERVER_URL: ${{ vars.NIKS3_SERVER_URL }}
+        run: |
+          niks3 push "$(cat "$RUNNER_TEMP/toplevel")"
+
+      - name: Pin the release in the cache
+        env:
+          NIKS3_AUTH_TOKEN_FILE: "/tmp/niks3-token"
+          NIKS3_SERVER_URL: ${{ vars.NIKS3_SERVER_URL }}
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          niks3 pins create "blueos-${{ matrix.board }}-$TAG" "$(cat "$RUNNER_TEMP/toplevel")"
+
+      - name: Collect the release metadata
+        run: |
+          toplevel="$(cat "$RUNNER_TEMP/toplevel")"
+          case "$toplevel" in
+            /nix/store/*) ;;
+            *) echo "'$toplevel' is not a store path." >&2; exit 1 ;;
+          esac
+
+          # Read from the option rather than the matrix, because this is the
+          # value the daemon filters releases by. Selecting the fields instead
+          # of copying the file keeps anything else the closure records out of
+          # the published contract.
+          board="$(nix eval --raw \
+            ".#nixosConfigurations.blueos-${{ matrix.board }}.config.services.blueos.board")"
+          jq --arg board "$board" --arg toplevel "$toplevel" \
+            '{board: $board, channel, version, revision, toplevel: $toplevel}' \
+            "$toplevel/etc/blueos/release.json" > "$RUNNER_TEMP/release.json"
+          cat "$RUNNER_TEMP/release.json"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ matrix.board }}
+          path: ${{ runner.temp }}/release.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Build the SD card image
+        run: |
+          nix build .#nixosConfigurations.blueos-${{ matrix.board }}.config.system.build.sdImage \
+            --out-link result
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: blueos-${{ matrix.board }}
+          path: result/sd-image/*.img.zst
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish the manifest and the release assets
+    needs: image
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+    concurrency:
+      # Serialises manifest writes across concurrent releases. Two tags landing
+      # at once would otherwise read the same previous manifest and one would
+      # overwrite the other's entry.
+      group: manifest-publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: release-*
+          path: ${{ runner.temp }}/releases
+
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: blueos-*
+          path: ${{ runner.temp }}/images
+          merge-multiple: true
+
+      - name: Merge into the published manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          shopt -s nullglob
+          sources=("$RUNNER_TEMP"/releases/*/release.json)
+          shopt -u nullglob
+          if [ "${#sources[@]}" -eq 0 ]; then
+            echo "No release metadata was produced." >&2
+            exit 1
+          fi
+
+          work="$RUNNER_TEMP/manifest"
+          git init --quiet "$work"
+          git -C "$work" remote add origin \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if git -C "$work" fetch --quiet --depth=1 origin gh-pages 2>/dev/null; then
+            git -C "$work" checkout --quiet -B gh-pages FETCH_HEAD
+          else
+            # First publish. An orphan branch keeps this history free of the
+            # source tree, since the file is the only thing the branch holds.
+            git -C "$work" checkout --quiet --orphan gh-pages
+          fi
+
+          manifest="$work/manifest.json"
+          previous='[]'
+          if [ -f "$manifest" ]; then
+            previous="$(jq -c '.releases // []' "$manifest")"
+          fi
+
+          # A re-run of an old tag is a rebuild of that version, so it takes the
+          # place of the entry it replaces rather than appearing beside it. When
+          # the build is byte-for-byte the one already listed, its original
+          # `published` is kept so re-running a tag changes nothing.
+          published="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          entries="$(jq -s -c --arg published "$published" \
+            'map(. + {published: $published})' "${sources[@]}")"
+
+          jq -S -n --argjson previous "$previous" --argjson entries "$entries" '
+            ($previous + $entries)
+            | group_by([.board, .version])
+            | map(
+                max_by(.published // "") as $newest
+                | ($previous
+                   | map(select(.board == $newest.board
+                                and .version == $newest.version
+                                and .toplevel == $newest.toplevel))
+                   | first) as $existing
+                | if $existing then $existing else $newest end
+              )
+            | sort_by(.published // "")
+            | reverse
+            | {releases: .}
+          ' > "$manifest"
+          cat "$manifest"
+
+          # GitHub Pages serves index.html at the site root, so a bare
+          # /manifest.json would 404 even though the file is there.
+          cat > "$work/index.html" <<'HTML'
+          <!doctype html>
+          <meta charset="utf-8">
+          <title>BlueOS releases</title>
+          <p>Release manifest: <a href="manifest.json">manifest.json</a></p>
+          HTML
+
+          git -C "$work" config user.name "github-actions[bot]"
+          git -C "$work" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "$work" add manifest.json index.html
+          if git -C "$work" diff --cached --quiet; then
+            echo "The manifest already lists these builds."
+            exit 0
+          fi
+          git -C "$work" commit --quiet --message "Publish ${TAG}"
+          git -C "$work" push --quiet origin gh-pages
+
+      # The manifest is published first: a device that sees a release can then
+      # download its image, but never the other way round.
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        env:
+          # Under workflow_dispatch github.ref is the branch, so the tag has to
+          # be named explicitly for the release to attach to the right place.
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        with:
+          files: ${{ runner.temp }}/images/*.img.zst
+          tag_name: ${{ env.TAG }}
+          generate_release_notes: true
+
+  # Points Pages at gh-pages once, and keeps it pointed there afterwards. The
+  # branch only exists after the first publish, so this cannot be a one-time
+  # manual step done before the workflow runs.
+  pages:
+    name: Serve the manifest from GitHub Pages
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+    steps:
+      - name: Point Pages at gh-pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          body='{"source":{"branch":"gh-pages","path":"/"}}'
+
+          # POST configures a site that does not exist yet and fails with 409
+          # once it does, at which point PUT updates it. Both are idempotent, so
+          # re-running a release never breaks on this step.
+          status="$(printf '%s' "$body" | gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/pages" --input - 2>&1)" && { echo "$status"; exit 0; }
+          echo "$status"
+          printf '%s' "$body" | gh api --method PUT \
+            "repos/${GITHUB_REPOSITORY}/pages" --input -
